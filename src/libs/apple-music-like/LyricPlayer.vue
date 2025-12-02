@@ -1,34 +1,46 @@
 <template>
   <LyricPlayer 
     ref="lyricPlayerRef" 
-    :lyricLines="currentLyrics" 
+    :lyricLines="toRaw(currentLyrics)" 
     :currentTime="currentTime"
-    :playing="music.playState"
+    :playing="playState"
     :alignAnchor="alignAnchor"
     :alignPosition="alignPosition" 
-    :enableSpring="setting.showYrcAnimation"
-    :enableScale="setting.showYrcAnimation" 
-    :enableBlur="setting.lyricsBlur"
+    :enableSpring="copyValue('showYrcAnimation')"
+    :enableScale="copyValue('showYrcAnimation')" 
+    :enableBlur="copyValue('lyricsBlur')"
     :enableInterludeDots="true"
     :wordFadeWidth="0.5" 
-    :linePosXSpringParams="setting.springParams.posX"
-    :linePosYSpringParams="setting.springParams.posY" 
-    :lineScaleSpringParams="setting.springParams.scale" 
+    :linePosXSpringParams="copyValue('springParams.posX')"
+    :linePosYSpringParams="copyValue('springParams.posY')" 
+    :lineScaleSpringParams="copyValue('springParams.scale')" 
     :style="lyricStyles"
     @line-click="handleLineClick" 
   />
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue';
+import { ref, computed, watch, onMounted,watchEffect, toRaw } from 'vue';
 import { musicStore, settingStore, siteStore } from "../../store";
 import { LyricPlayer, type LyricPlayerRef } from "@applemusic-like-lyrics/vue";
-import { createLyricsProcessor, type LyricLine } from "./processLyrics";
+import { preprocessLyrics, getProcessedLyrics, type LyricLine } from "./processLyrics";
 
 const lyricPlayerRef = ref<LyricPlayerRef>();
 const site = siteStore();
 const music = musicStore();
 const setting = settingStore();
+const fontSize = ref(setting.lyricsFontSize * 3);
+
+const playState = ref(false);
+const currentTime = ref(0);
+
+watchEffect(() => {
+  playState.value = music.playState;
+});
+
+const copyValue = (value: any) => {
+  return setting[value];
+};
 
 const emit = defineEmits<{
   'line-click': [e: { line: { getLine: () => { startTime: number } } }],
@@ -36,9 +48,10 @@ const emit = defineEmits<{
 }>();
 
 // 计算当前播放时间
-const currentTime = computed(() => 
-  music.persistData.playSongTime.currentTime * 1000
-);
+watchEffect(() => {
+  // 提前 150ms 来解决异步更新延迟问题
+  currentTime.value = (music.persistData.playSongTime.currentTime * 1000) + 150;
+});
 
 // 计算对齐方式
 const alignAnchor = computed(() => 
@@ -52,8 +65,9 @@ const alignPosition = computed(() =>
 // 计算歌词样式
 const lyricStyles = computed(() => ({
   '--amll-lp-color': mainColor.value,
-  '--amll-lyric-player-font-size': `${setting.lyricsFontSize * 11}px`,
+  '--amll-lp-font-size': `${fontSize.value}px`,
   '--amll-lp-height': setting.lyricLineHeight,
+  '--amll-lp-word-spacing': '0em',
   'font-weight': setting.lyricFontWeight,
   'font-family': setting.lyricFont,
   'letter-spacing': setting.lyricLetterSpacing,
@@ -62,6 +76,11 @@ const lyricStyles = computed(() => ({
   'user-select': 'none',
   '-webkit-tap-highlight-color': 'transparent'
 }));
+
+watch(() => setting.lyricsFontSize, (newSize) => {
+  fontSize.value = newSize * 3;
+  lyricPlayerRef.value?.lyricPlayer?.value?.update();
+});
 
 // 处理歌词点击
 const handleLineClick = (e: { line: { getLine: () => { startTime: number } } }) => {
@@ -77,22 +96,66 @@ const mainColor = computed(() => {
   return `rgb(${site.songPicColor})`;
 });
 
-// 获取当前歌词
+// 在组件挂载时预处理歌词，提前缓存结果
+onMounted(() => {
+  // 如果有歌词数据，预处理并缓存结果
+  if (music.songLyric) {
+    lyricPlayerRef.value?.lyricPlayer?.value?.setCurrentTime(currentTime.value);
+    music.playState == true ? lyricPlayerRef.value?.lyricPlayer?.value?.resume() : lyricPlayerRef.value?.lyricPlayer?.value?.pause();
+    lyricPlayerRef.value?.lyricPlayer?.value?.calcLayout();
+    lyricPlayerRef.value?.lyricPlayer?.value?.update();
+    console.log("[LyricPlayer] 组件挂载时预处理歌词数据");
+    try {
+      preprocessLyrics(music.songLyric, { 
+        showYrc: setting.showYrc,
+        showRoma: setting.showRoma,
+        showTransl: setting.showTransl
+      });
+    } catch (error) {
+      console.error("[LyricPlayer] 预处理歌词失败", error);
+    }
+  }
+});
+
+// 获取当前歌词 - 优先使用预处理缓存
 const currentLyrics = computed<LyricLine[]>(() => {
-  const songLyric = music.songLyric || { lrcAMData: [], yrcAMData: [] };
-  const lyricData = createLyricsProcessor(songLyric, { 
+  const rawSongLyric = toRaw(music.songLyric) || { lrcAMData: [], yrcAMData: [], hasTTML: false, ttml: [] };
+  
+  // 记录歌词数据来源信息
+  if (!rawSongLyric.lrcAMData?.length && !rawSongLyric.yrcAMData?.length && !rawSongLyric.ttml?.length) {
+    console.log("[LyricPlayer] 未检测到有效歌词数据");
+    return [];
+  }
+  
+  // 使用优化后的函数获取歌词，优先使用缓存数据
+  return getProcessedLyrics(rawSongLyric, { 
     showYrc: setting.showYrc,
     showRoma: setting.showRoma,
     showTransl: setting.showTransl
   });
-  return lyricData;
 });
+
+// 监听歌曲变化时预处理歌词
+watch(() => music.songLyric, (newLyric) => {
+  if (newLyric) {
+    console.log("[LyricPlayer] 歌词数据变化，预处理新的歌词");
+    try {
+      preprocessLyrics(newLyric, { 
+        showYrc: setting.showYrc,
+        showRoma: setting.showRoma,
+        showTransl: setting.showTransl
+      });
+    } catch (error) {
+      console.error("[LyricPlayer] 预处理新歌词失败", error);
+    }
+  }
+}, { deep: true });
 
 watch(() => music.playState, (newState) => {
   if (newState) {
     lyricPlayerRef.value?.lyricPlayer?.value?.setCurrentTime(currentTime.value);
   }
-});
+}, { immediate: true });
 </script>
 
 
